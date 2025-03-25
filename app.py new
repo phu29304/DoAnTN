@@ -1,0 +1,232 @@
+import os
+import json
+import io
+import traceback
+import pandas as pd
+from PIL import Image
+from flask import Flask, render_template, request, jsonify, send_from_directory, url_for, send_file
+from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
+import google.generativeai as genai
+import glob
+import re
+
+import google.generativeai as genai
+from dotenv import load_dotenv
+import os
+
+# Load API key từ file .env
+load_dotenv()
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Khởi tạo model Gemini
+model = genai.GenerativeModel('gemini-pro')
+
+
+# --- CẤU HÌNH ---
+load_dotenv()
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "default_secret_key")
+UPLOAD_FOLDER = 'uploads'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'pdf'}
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# --- GEMINI ---
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("[ERROR] Chưa cấu hình GEMINI_API_KEY trong .env")
+genai.configure(api_key=GEMINI_API_KEY)
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def extract_menu_from_image_gemini(image_path):
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+
+        img = Image.open(image_path)
+        img_blob = io.BytesIO()
+        img.save(img_blob, format='PNG')
+        img_blob.seek(0)
+        img_data = img_blob.read()
+
+        prompt = """
+Bạn là trợ lý AI nhận dạng thực đơn. Hãy phân tích hình ảnh thực đơn và xuất danh sách món ăn theo định dạng JSON chuẩn với các trường sau:
+- Phân loại: phân loại (nếu có, ví dụ: Món chính, Món phụ, Nước uống...)
+- Tên: tên món ăn
+- Giá tiền: giá (chỉ lấy số, đơn vị là VND)
+- Mô tả: mô tả tiếng Việt (nếu có)
+
+Hãy đảm bảo thông tin rõ ràng, không dịch, không thêm chi tiết mới.
+Trả kết quả dưới dạng JSON list chuẩn (không cần giải thích thêm).
+"""
+
+
+
+        response = model.generate_content(
+            contents=[
+                {"text": prompt},
+                {"mime_type": "image/png", "data": img_data}
+            ],
+            stream=False
+        )
+
+        result_text = response.text.strip()
+        print("📦 [Gemini Output Raw]:\n", result_text[:1000])
+
+        # Trích xuất JSON từ khối markdown
+        json_match = re.search(r"```json(.*?)```", result_text, re.DOTALL)
+        cleaned_output = json_match.group(1).strip() if json_match else result_text
+
+        if not cleaned_output:
+            print("[ERROR] Output từ Gemini API trống.")
+            return []
+
+        menu_items = json.loads(cleaned_output)
+        if isinstance(menu_items, list):
+            return menu_items
+        else:
+            print("[ERROR] Kết quả không phải JSON list.")
+            return []
+    except Exception as e:
+        print(f"[ERROR] Gemini API failed: {e}")
+        traceback.print_exc()
+        return []
+
+
+import google.generativeai as genai
+
+def get_food_suggestions(num_people, min_budget, max_budget, menu_data):
+    prompt = f"""
+    Tôi có một danh sách thực đơn {menu_data}. 
+    Hãy gợi ý các món ăn phù hợp cho {num_people} người với ngân sách từ {min_budget} đến {max_budget}.
+    Trả lời dưới dạng danh sách JSON.
+    """
+    response = genai.generate_text(prompt=prompt)
+    return response  # Xử lý kết quả trước khi trả về
+
+
+def save_to_excel(data, excel_path):
+    if not isinstance(data, list) or len(data) == 0:
+        data = [{"error": "Không thể phân tích thực đơn, vui lòng thử lại!"}]
+    try:
+        df = pd.DataFrame(data)
+        df.to_excel(excel_path, index=False)
+        print(f"[INFO] Đã lưu file Excel: {excel_path}")
+    except Exception as e:
+        print("Lỗi khi lưu file Excel:", str(e))
+
+def get_latest_excel_file():
+    excel_files = glob.glob(os.path.join(app.config['UPLOAD_FOLDER'], '*.xlsx'))
+    if not excel_files:
+        return None
+    return max(excel_files, key=os.path.getmtime)
+
+import pandas as pd
+import re
+
+def parse_menu_table_from_text(text):
+    # Dùng regex để trích dòng dạng: Tên món | Giá | Mô tả
+    lines = text.strip().split('\n')
+    data = []
+    for line in lines:
+        if '|' in line:
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) >= 3:
+                data.append({
+                    'Tên món': parts[0],
+                    'Giá': parts[1],
+                    'Mô tả': parts[2]
+                })
+    return pd.DataFrame(data)
+
+
+# --- ROUTES ---
+@app.route('/')
+def index():
+    return render_template('menu.html')
+import json
+import os
+
+MENU_FILE_PATH = "processed_menu.json"
+
+@app.route('/process_menu', methods=['POST'])
+def process_menu():
+    if 'menu_image' not in request.files:
+        return jsonify({'error': 'No image uploaded'}), 400
+
+    image = request.files['menu_image']
+    image_path = "uploaded_image.png"
+    image.save(image_path)
+
+    # Gọi Gemini API để trích xuất thực đơn
+    menu_items = extract_menu_from_image_gemini(image_path)
+
+    if not menu_items:
+        return jsonify({'error': 'Không thể nhận dạng thực đơn'}), 400
+
+    # Lưu thực đơn vào file JSON
+    with open(MENU_FILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(menu_items, f, ensure_ascii=False, indent=2)
+
+    return jsonify({'message': 'Thực đơn đã được xử lý', 'menu': menu_items})
+
+
+@app.route('/uploads/<filename>')
+def download_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
+
+
+@app.route('/menu_suggestions', methods=['POST'])
+def menu_suggestions():
+    try:
+        data = request.json
+        print("🔍 Dữ liệu nhận được từ frontend:", data)
+
+        num_people = data.get("num_people")
+        min_budget = data.get("min_budget")
+        max_budget = data.get("max_budget")
+
+        if not num_people or not max_budget:
+            return jsonify({"success": False, "message": "Thiếu thông tin số người hoặc ngân sách!"}), 400
+
+        # Kiểm tra xem thực đơn có tồn tại không
+        menu_file_path = "menu_data.json"  # Thay bằng đường dẫn thực tế
+        if not os.path.exists(menu_file_path):
+            return jsonify({"success": False, "message": "Chưa có thực đơn!"}), 400
+
+        with open(menu_file_path, "r", encoding="utf-8") as f:
+            menu_data = json.load(f)
+        
+        print("📜 Thực đơn đã lưu:", menu_data)
+
+        if not menu_data:
+            return jsonify({"success": False, "message": "Thực đơn rỗng!"}), 400
+
+        # Gọi API Gemini để gợi ý món ăn
+        suggestions = get_food_suggestions(num_people, min_budget, max_budget, menu_data)
+
+        return jsonify({"success": True, "suggestions": suggestions})
+
+    except Exception as e:
+        print("❌ Lỗi xử lý gợi ý món ăn:", str(e))
+        return jsonify({"success": False, "message": "Lỗi server"}), 500
+    
+
+
+@app.route('/get_saved_menu', methods=['GET'])
+def get_saved_menu():
+    if not os.path.exists(MENU_FILE_PATH):
+        return jsonify([])  # Trả về danh sách rỗng nếu chưa có dữ liệu
+
+    with open(MENU_FILE_PATH, "r", encoding="utf-8") as f:
+        menu_data = json.load(f)
+
+    return jsonify(menu_data)
+
+
+
+# --- CHẠY ỨNG DỤNG ---
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
